@@ -164,6 +164,17 @@ export type UmamiTracker = {
       },
     ): Promise<void>;
   };
+  getFeatureValue: <T = unknown>(key: string, defaultValue?: T) => T | unknown;
+  isFeatureEnabled: (key: string) => boolean;
+  flags: () => Promise<
+    Record<
+      string,
+      {
+        enabled: boolean;
+        value: unknown;
+      }
+    >
+  >;
   getSession: () => {
     cache: string | undefined;
     website: string | null;

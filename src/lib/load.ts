@@ -1,6 +1,6 @@
-import type { Session, Website } from '@/generated/prisma/client';
+import type { FeatureFlag, Session, Website } from '@/generated/prisma/client';
 import redis from '@/lib/redis';
-import { getWebsite } from '@/queries/prisma';
+import { getWebsite, getWebsiteFeatureFlagDefinitions } from '@/queries/prisma';
 import { getWebsiteSession } from '@/queries/sql';
 
 export async function fetchWebsite(websiteId: string): Promise<Website> {
@@ -17,6 +17,24 @@ export async function fetchWebsite(websiteId: string): Promise<Website> {
   }
 
   return website;
+}
+
+export async function fetchWebsiteFeatureFlags(websiteId: string): Promise<FeatureFlag[]> {
+  if (redis.enabled) {
+    return redis.client.fetch(
+      `website:${websiteId}:flags`,
+      () => getWebsiteFeatureFlagDefinitions(websiteId),
+      300,
+    );
+  }
+
+  return getWebsiteFeatureFlagDefinitions(websiteId);
+}
+
+export async function clearWebsiteFeatureFlags(websiteId: string) {
+  if (redis.enabled) {
+    await redis.client.del(`website:${websiteId}:flags`);
+  }
 }
 
 export async function fetchSession(websiteId: string, sessionId: string): Promise<Session> {

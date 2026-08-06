@@ -174,6 +174,9 @@ export type UmamiTracker = {
      */
     (data: EventData & { id?: string }): Promise<void>;
   };
+  getFeatureValue: <T = unknown>(key: string, defaultValue?: T) => T | unknown;
+  isFeatureEnabled: (key: string) => boolean;
+  flags: () => Promise<Record<string, { enabled: boolean; value: unknown }>>;
   getSession: () => {
     cache: string | undefined;
     website: string | null;
@@ -255,6 +258,7 @@ type MetricEntry = PerformanceEntry & {
   const host =
     hostUrl || '__COLLECT_API_HOST__' || currentScript.src.split('/').slice(0, -1).join('/');
   const endpoint = `${host.replace(/\/$/, '')}__COLLECT_API_ENDPOINT__`;
+  const flagEndpoint = `${host.replace(/\/$/, '')}/api/flags/eval`;
   const screen = `${width}x${height}`;
   const eventRegex = /data-umami-event-([\w-_]+)/;
   const eventNameAttribute = `${_data}umami-event`;
@@ -444,8 +448,9 @@ type MetricEntry = PerformanceEntry & {
   ): Promise<void> => {
     const nextIdentity = typeof id === 'string' ? id : id.id;
 
-    if (nextIdentity !== undefined) {
+    if (nextIdentity !== undefined && nextIdentity !== identity) {
       identity = nextIdentity;
+      resetFlags();
     }
 
     cache = '';
@@ -456,6 +461,73 @@ type MetricEntry = PerformanceEntry & {
       },
       'identify',
     );
+  };
+
+  /* Feature flags */
+
+  const fetchFlags = async () => {
+    flagsStarted = true;
+    const requestIdentity = identity;
+
+    if (!website) return flagCache;
+
+    try {
+      const response = await fetch(flagEndpoint, {
+        keepalive: true,
+        method: 'POST',
+        body: JSON.stringify({ userKey: requestIdentity }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-umami-website-id': website as string,
+        },
+        credentials,
+      });
+      const data = (await response.json()) as { flags?: typeof flagCache };
+      if (requestIdentity === identity) {
+        flagCache = data.flags || {};
+      }
+    } catch {
+      /* Keep the last successful values. */
+    }
+
+    return flagCache;
+  };
+
+  const refreshFlags = () => {
+    if (!flagPromise) {
+      const request = fetchFlags();
+      flagPromise = request;
+      void request.finally(() => {
+        if (flagPromise === request) {
+          flagsLoaded = true;
+          flagPromise = undefined;
+          if (flagTimer) clearTimeout(flagTimer);
+          flagTimer = setTimeout(refreshFlags, 30000);
+        }
+      });
+    }
+
+    return flagPromise;
+  };
+
+  const loadFlags = () => (flagsLoaded ? Promise.resolve(flagCache) : refreshFlags());
+
+  const resetFlags = () => {
+    flagCache = {};
+    flagsLoaded = false;
+    if (flagTimer) clearTimeout(flagTimer);
+    flagPromise = undefined;
+    if (flagsStarted) void refreshFlags();
+  };
+
+  const getFeatureValue = <T = unknown>(key: string, defaultValue?: T): T | unknown => {
+    void loadFlags();
+    return key in flagCache ? flagCache[key].value : defaultValue;
+  };
+
+  const isFeatureEnabled = (key: string) => {
+    void loadFlags();
+    return flagCache[key]?.enabled === true;
   };
 
   /* Performance */
@@ -631,6 +703,9 @@ type MetricEntry = PerformanceEntry & {
     window.umami = {
       track,
       identify,
+      getFeatureValue,
+      isFeatureEnabled,
+      flags: loadFlags,
       getSession: () => ({ cache, website }),
     } as UmamiTracker;
   }
@@ -642,6 +717,11 @@ type MetricEntry = PerformanceEntry & {
   let disabled = false;
   let cache: string | undefined;
   let identity: string | undefined;
+  let flagCache: Record<string, { enabled: boolean; value: unknown }> = {};
+  let flagPromise: Promise<typeof flagCache> | undefined;
+  let flagTimer: ReturnType<typeof setTimeout> | undefined;
+  let flagsStarted = false;
+  let flagsLoaded = false;
   let flushPerformance: (() => void) | undefined;
 
   if (autoTrack && !trackingDisabled()) {

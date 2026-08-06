@@ -38,6 +38,20 @@ export function forbidden(error?: Record<string, any>) {
   );
 }
 
+export function tooManyRequests(error?: Record<string, any>) {
+  return Response.json(
+    {
+      error: {
+        message: 'Too many requests',
+        code: 'too-many-requests',
+        status: 429,
+        ...error,
+      },
+    },
+    { status: 429 },
+  );
+}
+
 export function payloadTooLarge(error?: Record<string, any>) {
   return Response.json(
     {

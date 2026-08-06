@@ -345,3 +345,76 @@ export const segmentParamSchema = z.object({
     })
     .optional(),
 });
+
+export const featureFlagValueTypeParam = z.enum(['boolean', 'string', 'number', 'json']);
+
+const featureFlagDefinitionShape = {
+  name: z.string().trim().min(1).max(200),
+  description: z.string().max(5000).optional(),
+  valueType: featureFlagValueTypeParam,
+  enabled: z.boolean(),
+  variations: z.array(z.object({ value: z.json() })).min(2),
+  rollout: z.object({
+    percentage: z.number().min(0).max(100),
+    weights: z.array(z.number().min(0).max(1)).optional(),
+  }),
+  defaultVariation: z.number().int().nonnegative(),
+};
+
+function validateFeatureFlagDefinition(
+  data: z.infer<z.ZodObject<typeof featureFlagDefinitionShape>>,
+  context: z.RefinementCtx,
+) {
+  if (data.defaultVariation >= data.variations.length) {
+    context.addIssue({
+      code: 'custom',
+      path: ['defaultVariation'],
+      message: 'Fallthrough variation must reference an existing variation',
+    });
+  }
+
+  for (const [index, variation] of data.variations.entries()) {
+    const value = variation.value;
+    const valid =
+      data.valueType === 'json' ||
+      (data.valueType === 'boolean' && typeof value === 'boolean') ||
+      (data.valueType === 'string' && typeof value === 'string') ||
+      (data.valueType === 'number' && typeof value === 'number');
+
+    if (!valid) {
+      context.addIssue({
+        code: 'custom',
+        path: ['variations', index, 'value'],
+        message: `Variation must contain a ${data.valueType} value`,
+      });
+    }
+  }
+
+  const { weights } = data.rollout;
+  if (weights) {
+    if (weights.length !== data.variations.length) {
+      context.addIssue({
+        code: 'custom',
+        path: ['rollout', 'weights'],
+        message: 'Weights must contain one entry per variation',
+      });
+    } else if (Math.abs(weights.reduce((sum, weight) => sum + weight, 0) - 1) > 0.000001) {
+      context.addIssue({
+        code: 'custom',
+        path: ['rollout', 'weights'],
+        message: 'Weights must sum to 1',
+      });
+    }
+  }
+}
+
+export const featureFlagCreateSchema = z
+  .object({
+    key: z.string().trim().min(1).max(200),
+    ...featureFlagDefinitionShape,
+  })
+  .superRefine(validateFeatureFlagDefinition);
+
+export const featureFlagUpdateSchema = z
+  .object(featureFlagDefinitionShape)
+  .superRefine(validateFeatureFlagDefinition);

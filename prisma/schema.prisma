@@ -105,6 +105,7 @@ model Website {
   sessionReplays      SessionReplay[]
   sessionReplaysSaved SessionReplaySaved[]
   heatmapEvents       HeatmapEvent[]
+  featureFlags        FeatureFlag[]
 
   @@index([userId])
   @@index([teamId])
@@ -282,6 +283,27 @@ model Segment {
 
   @@index([websiteId])
   @@map("segment")
+}
+
+model FeatureFlag {
+  id               String    @id() @map("feature_flag_id") @db.Uuid
+  websiteId        String    @map("website_id") @db.Uuid
+  key              String    @db.VarChar(200)
+  name             String    @db.VarChar(200)
+  description      String?   @db.Text
+  valueType        String    @map("value_type") @db.VarChar(20)
+  enabled          Boolean   @default(false)
+  variations       Json
+  rollout          Json
+  defaultVariation Int       @map("default_variation")
+  createdAt        DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime? @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  website Website @relation(fields: [websiteId], references: [id])
+
+  @@unique([websiteId, key])
+  @@index([websiteId])
+  @@map("feature_flag")
 }
 
 model Revenue {

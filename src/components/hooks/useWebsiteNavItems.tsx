@@ -136,6 +136,12 @@ export function useWebsiteNavItems(websiteId: string) {
           icon: <UserPlus />,
           path: renderPath('/cohorts'),
         },
+        {
+          id: 'flags',
+          label: 'Feature flags',
+          icon: <Lightning />,
+          path: renderPath('/flags'),
+        },
       ],
     },
     {
