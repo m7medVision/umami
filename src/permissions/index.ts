@@ -1,5 +1,6 @@
 export * from './board';
 export * from './entity';
+export * from './experiment';
 export * from './featureFlag';
 export * from './link';
 export * from './pixel';

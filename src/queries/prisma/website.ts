@@ -1,10 +1,14 @@
+import { z } from 'zod';
 import type { Prisma, Website } from '@/generated/prisma/client';
 import { ROLES } from '@/lib/constants';
 import prisma from '@/lib/prisma';
 import redis from '@/lib/redis';
 import { sanitizeSortFilters } from '@/lib/sort';
 import type { QueryFilters } from '@/lib/types';
-import { z } from 'zod';
+import {
+  deleteWebsiteExperimentData,
+  resetWebsiteExperimentData,
+} from '@/queries/sql/experiments/cleanup';
 
 const WEBSITE_SORT_FIELDS = ['name', 'domain', 'createdAt'] as const;
 
@@ -139,9 +143,18 @@ export async function updateWebsite(
 export async function resetWebsite(websiteId: string) {
   const { transaction } = prisma;
   const cloudMode = !!process.env.CLOUD_MODE;
+  const resetAt = new Date();
+
+  // A configured ClickHouse failure is a real destructive-operation failure: stop before
+  // PostgreSQL is changed so the API never reports a reset that only partially happened.
+  await resetWebsiteExperimentData(websiteId);
 
   return transaction(
     async tx => {
+      await tx.experimentRun.updateMany({
+        where: { websiteId, rawDataExpiredAt: null },
+        data: { rawDataExpiredAt: resetAt },
+      });
       await tx.sessionReplaySaved.deleteMany({
         where: { websiteId },
       });
@@ -173,7 +186,7 @@ export async function resetWebsite(websiteId: string) {
       const website = await tx.website.update({
         where: { id: websiteId },
         data: {
-          resetAt: new Date(),
+          resetAt,
         },
       });
 
@@ -183,7 +196,7 @@ export async function resetWebsite(websiteId: string) {
       timeout: 30000,
     },
   ).then(async data => {
-    if (cloudMode) {
+    if (cloudMode && redis.enabled) {
       await redis.client.set(`website:${websiteId}`, data);
     }
 
@@ -195,8 +208,26 @@ export async function deleteWebsite(websiteId: string) {
   const { transaction } = prisma;
   const cloudMode = !!process.env.CLOUD_MODE;
 
+  // Run synchronous mutations before PostgreSQL deletion. If ClickHouse is configured but
+  // unavailable, surface that failure and leave the Website intact for a safe retry.
+  await deleteWebsiteExperimentData(websiteId);
+
   return transaction(
     async tx => {
+      await tx.experimentNotification.deleteMany({ where: { websiteId } });
+      await tx.experimentPrivacyAudit.deleteMany({ where: { websiteId } });
+      await tx.experimentPromotion.deleteMany({ where: { websiteId } });
+      await tx.experimentResultSnapshot.deleteMany({
+        where: { experimentRun: { websiteId } },
+      });
+      await tx.experimentOutcome.deleteMany({
+        where: { experimentRun: { websiteId } },
+      });
+      await tx.experimentRun.deleteMany({ where: { websiteId } });
+      await tx.experiment.deleteMany({ where: { websiteId } });
+      await tx.mutualExclusionGroup.deleteMany({ where: { websiteId } });
+      await tx.featureFlag.deleteMany({ where: { websiteId } });
+
       await tx.sessionReplaySaved.deleteMany({
         where: { websiteId },
       });
@@ -254,7 +285,7 @@ export async function deleteWebsite(websiteId: string) {
       timeout: 30000,
     },
   ).then(async data => {
-    if (cloudMode) {
+    if (cloudMode && redis.enabled) {
       await redis.client.del(`website:${websiteId}`);
     }
 

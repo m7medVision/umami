@@ -1,13 +1,20 @@
 import { z } from 'zod';
-import { asEvaluableFeatureFlag, evaluateFlag } from '@/lib/flags';
+import {
+  createExperimentFeatureFlagEvaluationDependencies,
+  evaluateExperimentFeatureFlags,
+} from '@/lib/experiments/evaluation';
 import { fetchWebsite, fetchWebsiteFeatureFlags } from '@/lib/load';
 import redis from '@/lib/redis';
 import { parseRequest } from '@/lib/request';
 import { badRequest, json, notFound, tooManyRequests } from '@/lib/response';
+import { getRunningFeatureFlagExperimentRun } from '@/queries/prisma';
+import { clickhouseExperimentAssignmentAdapter } from '@/queries/sql';
 
 const schema = z.object({
   userKey: z.string().min(1).optional(),
+  assignmentKey: z.uuid().optional(),
   context: z.record(z.string(), z.json()).optional(),
+  participate: z.boolean().default(true),
 });
 
 const RATE_LIMIT = Number(process.env.FEATURE_FLAG_RATE_LIMIT || 1000);
@@ -17,7 +24,11 @@ const memoryRateLimits = new Map<string, { count: number; expiresAt: number }>()
 async function isRateLimited(websiteId: string) {
   const key = `flag-eval:${websiteId}`;
   if (redis.enabled) {
-    return redis.client.rateLimit(key, RATE_LIMIT, RATE_LIMIT_WINDOW);
+    try {
+      return await redis.client.rateLimit(key, RATE_LIMIT, RATE_LIMIT_WINDOW);
+    } catch {
+      // Continue with process-local protection; Redis availability must not gate flag evaluation.
+    }
   }
 
   const now = Date.now();
@@ -30,6 +41,11 @@ async function isRateLimited(websiteId: string) {
   current.count += 1;
   return current.count >= RATE_LIMIT;
 }
+
+const evaluationDependencies = createExperimentFeatureFlagEvaluationDependencies({
+  findRunningRun: getRunningFeatureFlagExperimentRun,
+  assignmentAdapter: clickhouseExperimentAssignmentAdapter,
+});
 
 export async function POST(request: Request) {
   const { body, error } = await parseRequest(request, schema, { skipAuth: true });
@@ -52,19 +68,17 @@ export async function POST(request: Request) {
   }
 
   const definitions = await fetchWebsiteFeatureFlags(websiteId);
-  const flags = Object.fromEntries(
-    definitions.map(flag => {
-      const evaluation = evaluateFlag(asEvaluableFeatureFlag(flag), body.userKey);
-
-      return [
-        flag.key,
-        {
-          enabled: flag.enabled && evaluation.value !== false && evaluation.value != null,
-          value: evaluation.value,
-        },
-      ];
-    }),
+  const result = await evaluateExperimentFeatureFlags(
+    {
+      websiteId,
+      definitions,
+      userKey: body.userKey,
+      assignmentKey: body.assignmentKey,
+      context: body.context,
+      participate: body.participate,
+    },
+    evaluationDependencies,
   );
 
-  return json({ flags });
+  return json(result);
 }

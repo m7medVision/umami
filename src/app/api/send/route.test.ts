@@ -9,6 +9,7 @@ import clickhouse from '@/lib/clickhouse';
 import { CACHE_TOKEN_TYPE, EVENT_TYPE } from '@/lib/constants';
 import { secret } from '@/lib/crypto';
 import { getClientInfo, hasBlockedIp } from '@/lib/detect';
+import { ingestExposure } from '@/lib/experiments/ingestExposureService';
 import { createToken, parseToken } from '@/lib/jwt';
 import { fetchWebsite } from '@/lib/load';
 import { parseRequest } from '@/lib/request';
@@ -30,6 +31,10 @@ vi.mock('@/lib/detect', () => ({
 
 vi.mock('@/lib/load', () => ({
   fetchWebsite: vi.fn(),
+}));
+
+vi.mock('@/lib/experiments/ingestExposureService', () => ({
+  ingestExposure: vi.fn(),
 }));
 
 vi.mock('@/lib/request', () => ({
@@ -58,6 +63,7 @@ const saveEventMock = vi.mocked(saveEvent);
 const saveSessionDataMock = vi.mocked(saveSessionData);
 const saveSessionLinkMock = vi.mocked(saveSessionLink);
 const updateSessionMock = vi.mocked(updateSession);
+const ingestExposureMock = vi.mocked(ingestExposure);
 
 const WEBSITE_ID = '11111111-1111-4111-8111-111111111111';
 const LINK_ID = '22222222-2222-4222-8222-222222222222';
@@ -109,6 +115,7 @@ beforeEach(() => {
   saveSessionDataMock.mockResolvedValue(undefined as any);
   saveSessionLinkMock.mockResolvedValue(undefined as any);
   updateSessionMock.mockResolvedValue(undefined as any);
+  ingestExposureMock.mockResolvedValue({ accepted: true, saved: true });
 });
 
 describe('parseRequest error handling', () => {
@@ -198,6 +205,33 @@ describe('schema validation', () => {
     expect(
       schema.safeParse({ type: 'event', payload: { website: WEBSITE_ID, name: 'signup' } }).success,
     ).toBe(true);
+  });
+
+  test('accepts the strict flag-exposure shape and rejects forged authority fields', async () => {
+    const schema = await getSchema();
+    const payload = {
+      website: WEBSITE_ID,
+      featureFlagKey: 'checkout-layout',
+      variation: 1,
+      idempotencyKey: 'opaque-reference.44444444-4444-4444-8444-444444444444',
+      source: 'auto',
+      sdkVersion: '3.2.0',
+    };
+
+    expect(schema.safeParse({ type: 'flag-exposure', payload }).success).toBe(true);
+    for (const forged of [
+      'experimentRunId',
+      'sessionId',
+      'visitorDigest',
+      'identity',
+      'context',
+      'data',
+    ]) {
+      expect(
+        schema.safeParse({ type: 'flag-exposure', payload: { ...payload, [forged]: 'forged' } })
+          .success,
+      ).toBe(false);
+    }
   });
 
   test('enforces web vitals numeric bounds', async () => {
@@ -753,6 +787,112 @@ describe('performance collection', () => {
       fcp: 900,
       ttfb: 300,
     });
+  });
+});
+
+describe('flag Exposure collection', () => {
+  const exposurePayload = {
+    website: WEBSITE_ID,
+    featureFlagKey: 'checkout-layout',
+    variation: 1,
+    idempotencyKey: 'opaque-reference.44444444-4444-4444-8444-444444444444',
+    source: 'auto',
+    sdkVersion: '3.2.0',
+  };
+
+  test('passes only authoritative Website/session context to ingestion', async () => {
+    const token = createToken(
+      {
+        type: CACHE_TOKEN_TYPE,
+        websiteId: WEBSITE_ID,
+        sessionId: '55555555-5555-4555-8555-555555555555',
+        visitId: '66666666-6666-4666-8666-666666666666',
+        iat: Math.floor(Date.now() / 1000),
+      },
+      secret(),
+    );
+
+    const response = await callPOST(
+      { type: 'flag-exposure', payload: exposurePayload },
+      { headers: { 'x-umami-cache': token } },
+    );
+
+    expect(response.status).toBe(200);
+    expect(ingestExposureMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        websiteId: WEBSITE_ID,
+        sessionId: '55555555-5555-4555-8555-555555555555',
+        featureFlagKey: 'checkout-layout',
+        variation: 1,
+      }),
+    );
+  });
+
+  test('does not trust a cache token issued for another Website', async () => {
+    const otherWebsite = '77777777-7777-4777-8777-777777777777';
+    const token = createToken(
+      {
+        type: CACHE_TOKEN_TYPE,
+        websiteId: otherWebsite,
+        sessionId: '88888888-8888-4888-8888-888888888888',
+        visitId: '99999999-9999-4999-8999-999999999999',
+        iat: Math.floor(Date.now() / 1000),
+      },
+      secret(),
+    );
+
+    await callPOST(
+      { type: 'flag-exposure', payload: exposurePayload },
+      { headers: { 'x-umami-cache': token } },
+    );
+
+    expect(fetchWebsiteMock).toHaveBeenCalledWith(WEBSITE_ID);
+    expect(ingestExposureMock).toHaveBeenCalledWith(
+      expect.not.objectContaining({ sessionId: '88888888-8888-4888-8888-888888888888' }),
+    );
+  });
+
+  test('bot and blocked-IP gates run before Exposure ingestion', async () => {
+    isbotMock.mockReturnValue(true);
+    await callPOST({ type: 'flag-exposure', payload: exposurePayload });
+    expect(ingestExposureMock).not.toHaveBeenCalled();
+
+    isbotMock.mockReturnValue(false);
+    hasBlockedIpMock.mockReturnValue(true);
+    const blocked = await callPOST({ type: 'flag-exposure', payload: exposurePayload });
+    expect(blocked.status).toBe(403);
+    expect(ingestExposureMock).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    [{ accepted: false, saved: false, reason: 'collection-failure' }],
+    [new Error('ClickHouse unavailable')],
+  ])('transient Exposure collection failure returns a retryable 503', async result => {
+    if (result instanceof Error) {
+      ingestExposureMock.mockRejectedValue(result);
+    } else {
+      ingestExposureMock.mockResolvedValue(result);
+    }
+
+    const response = await callPOST({ type: 'flag-exposure', payload: exposurePayload });
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('1');
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: 'collection-unavailable', status: 503 },
+    });
+  });
+
+  test('non-transient rejected Exposure returns the normal non-retry response', async () => {
+    ingestExposureMock.mockResolvedValue({
+      accepted: false,
+      saved: false,
+      reason: 'assignment-mismatch',
+    });
+
+    const response = await callPOST({ type: 'flag-exposure', payload: exposurePayload });
+
+    expect(response.status).toBe(200);
   });
 });
 

@@ -5,13 +5,20 @@ import clickhouse from '@/lib/clickhouse';
 import { CACHE_TOKEN_TYPE, COLLECTION_TYPE, EVENT_TYPE } from '@/lib/constants';
 import { getSalt, hash, secret, uuid } from '@/lib/crypto';
 import { getClientInfo, hasBlockedIp } from '@/lib/detect';
+import { ingestExposure } from '@/lib/experiments/ingestExposureService';
 import { createToken, parseToken } from '@/lib/jwt';
 import { fetchWebsite } from '@/lib/load';
 import { parseRequest } from '@/lib/request';
 import { badRequest, forbidden, json, serverError } from '@/lib/response';
 import { anyObjectParam, urlOrPathParam } from '@/lib/schema';
 import { safeDecodeURI, safeDecodeURIComponent } from '@/lib/url';
-import { createSession, saveEvent, saveSessionData, saveSessionLink, updateSession } from '@/queries/sql';
+import {
+  createSession,
+  saveEvent,
+  saveSessionData,
+  saveSessionLink,
+  updateSession,
+} from '@/queries/sql';
 
 interface Cache {
   websiteId: string;
@@ -29,47 +36,63 @@ const safeStringParam = () =>
     message: 'Value must not start with =, +, -, @, tab, or carriage return',
   });
 
-const schema = z.object({
-  type: z.enum(['event', 'identify', 'performance']),
-  payload: z
-    .object({
-      website: z.uuid().optional(),
-      link: z.uuid().optional(),
-      pixel: z.uuid().optional(),
-      data: anyObjectParam.optional(),
-      hostname: z.string().optional(),
-      language: z.string().optional(),
-      referrer: urlOrPathParam.optional(),
-      screen: z.string().optional(),
-      title: z.string().optional(),
-      url: urlOrPathParam.optional(),
-      name: safeStringParam().optional(),
-      tag: safeStringParam().optional(),
-      ip: z.string().optional(),
-      userAgent: z.string().optional(),
-      timestamp: z.coerce.number().int().optional(),
-      id: z.string().optional(),
-      browser: z.string().optional(),
-      os: z.string().optional(),
-      device: z.string().optional(),
-      lcp: z.number().nonnegative().max(60000).optional(),
-      inp: z.number().nonnegative().max(60000).optional(),
-      cls: z.number().nonnegative().max(100).optional(),
-      fcp: z.number().nonnegative().max(60000).optional(),
-      ttfb: z.number().nonnegative().max(60000).optional(),
-    })
-    .refine(
-      data => {
-        const keys = [data.website, data.link, data.pixel];
-        const count = keys.filter(Boolean).length;
-        return count === 1;
-      },
-      {
-        message: 'Exactly one of website, link, or pixel must be provided',
-        path: ['website'],
-      },
-    ),
-});
+const analyticsPayloadSchema = z
+  .object({
+    website: z.uuid().optional(),
+    link: z.uuid().optional(),
+    pixel: z.uuid().optional(),
+    data: anyObjectParam.optional(),
+    hostname: z.string().optional(),
+    language: z.string().optional(),
+    referrer: urlOrPathParam.optional(),
+    screen: z.string().optional(),
+    title: z.string().optional(),
+    url: urlOrPathParam.optional(),
+    name: safeStringParam().optional(),
+    tag: safeStringParam().optional(),
+    ip: z.string().optional(),
+    userAgent: z.string().optional(),
+    timestamp: z.coerce.number().int().optional(),
+    id: z.string().optional(),
+    browser: z.string().optional(),
+    os: z.string().optional(),
+    device: z.string().optional(),
+    lcp: z.number().nonnegative().max(60000).optional(),
+    inp: z.number().nonnegative().max(60000).optional(),
+    cls: z.number().nonnegative().max(100).optional(),
+    fcp: z.number().nonnegative().max(60000).optional(),
+    ttfb: z.number().nonnegative().max(60000).optional(),
+  })
+  .refine(
+    data => {
+      const keys = [data.website, data.link, data.pixel];
+      const count = keys.filter(Boolean).length;
+      return count === 1;
+    },
+    {
+      message: 'Exactly one of website, link, or pixel must be provided',
+      path: ['website'],
+    },
+  );
+
+const flagExposurePayloadSchema = z
+  .object({
+    website: z.uuid(),
+    featureFlagKey: z.string().trim().min(1).max(200),
+    variation: z.number().int().nonnegative().max(65535),
+    idempotencyKey: z.string().min(1).max(2048),
+    source: z.enum(['auto', 'explicit']),
+    sdkVersion: z.string().trim().min(1).max(50),
+  })
+  .strict();
+
+const schema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.enum(['event', 'identify', 'performance']),
+    payload: analyticsPayloadSchema,
+  }),
+  z.object({ type: z.literal('flag-exposure'), payload: flagExposurePayloadSchema }),
+]);
 
 export async function POST(request: Request) {
   try {
@@ -114,7 +137,7 @@ export async function POST(request: Request) {
       if (cacheHeader) {
         const result = await parseToken(cacheHeader, secret());
 
-        if (result?.type === CACHE_TOKEN_TYPE) {
+        if (result?.type === CACHE_TOKEN_TYPE && result.websiteId === websiteId) {
           cache = result;
         }
       }
@@ -155,7 +178,7 @@ export async function POST(request: Request) {
     const sessionSalt = getSalt(saltRotation, createdAt);
     const visitSalt = hash(startOfHour(createdAt).toUTCString());
 
-    const sessionId = uuid(sourceId, ip, userAgent, sessionSalt);
+    const sessionId = cache?.sessionId || uuid(sourceId, ip, userAgent, sessionSalt);
 
     // Create a session if not found
     if (!clickhouse.enabled && !cache?.sessionId) {
@@ -185,7 +208,46 @@ export async function POST(request: Request) {
       iat = now;
     }
 
-    if (type === COLLECTION_TYPE.event) {
+    if (type === COLLECTION_TYPE.flagExposure) {
+      const { featureFlagKey, variation, idempotencyKey, source, sdkVersion } = payload;
+      try {
+        const result = await ingestExposure({
+          websiteId,
+          sessionId,
+          featureFlagKey,
+          variation,
+          idempotencyKey,
+          source,
+          sdkVersion,
+          exposedAt: createdAt,
+        });
+        if (result.reason === 'collection-failure') {
+          return Response.json(
+            {
+              error: {
+                message: 'Exposure collection temporarily unavailable',
+                code: 'collection-unavailable',
+                status: 503,
+              },
+            },
+            { status: 503, headers: { 'Retry-After': '1' } },
+          );
+        }
+      } catch {
+        // Only Exposure transport sees this retryable response. Feature Flag
+        // evaluation and ordinary analytics collection remain unaffected.
+        return Response.json(
+          {
+            error: {
+              message: 'Exposure collection temporarily unavailable',
+              code: 'collection-unavailable',
+              status: 503,
+            },
+          },
+          { status: 503, headers: { 'Retry-After': '1' } },
+        );
+      }
+    } else if (type === COLLECTION_TYPE.event) {
       const base = hostname ? `https://${hostname}` : 'https://localhost';
       const currentUrl = new URL(url, base);
 

@@ -240,17 +240,20 @@ function parseFilters(filters: Record<string, any>, options?: QueryOptions) {
   const cohortFilters = Object.fromEntries(
     Object.entries(filters).filter(([key]) => key.startsWith('cohort_')),
   );
-  const {
-    sql: eventPropertyFilterQuery,
-    params: eventPropertyFilterParams,
-  } = getEventPropertyFilterQuery((filters as QueryFilters).eventPropertyFilters, filters.timezone);
-  const {
-    sql: sessionPropertyFilterQuery,
-    params: sessionPropertyFilterParams,
-  } = getSessionPropertyFilterQuery((filters as QueryFilters).sessionPropertyFilters, filters.timezone);
+  const { sql: eventPropertyFilterQuery, params: eventPropertyFilterParams } =
+    getEventPropertyFilterQuery((filters as QueryFilters).eventPropertyFilters, filters.timezone);
+  const { sql: sessionPropertyFilterQuery, params: sessionPropertyFilterParams } =
+    getSessionPropertyFilterQuery(
+      (filters as QueryFilters).sessionPropertyFilters,
+      filters.timezone,
+    );
 
   return {
-    filterQuery: [getFilterQuery(filters, options), eventPropertyFilterQuery, sessionPropertyFilterQuery]
+    filterQuery: [
+      getFilterQuery(filters, options),
+      eventPropertyFilterQuery,
+      sessionPropertyFilterQuery,
+    ]
       .filter(Boolean)
       .join('\n'),
     dateQuery: getDateQuery(filters),
@@ -670,14 +673,30 @@ async function pagedRawQuery(
   };
 }
 
+function logQuery(
+  query: string,
+  params: Record<string, unknown>,
+  name?: string,
+  sensitiveParams: readonly string[] = [],
+) {
+  if (process.env.LOG_QUERY) {
+    const redactedParams = Object.fromEntries(
+      Object.entries(params).map(([key, value]) => [
+        key,
+        sensitiveParams.includes(key) ? '[REDACTED]' : value,
+      ]),
+    );
+    log({ query, params: redactedParams, name });
+  }
+}
+
 async function rawQuery<T = unknown>(
   query: string,
   params: Record<string, unknown> = {},
   name?: string,
+  sensitiveParams: readonly string[] = [],
 ): Promise<T> {
-  if (process.env.LOG_QUERY) {
-    log({ query, params, name });
-  }
+  logQuery(query, params, name, sensitiveParams);
 
   await connect();
 
@@ -692,6 +711,19 @@ async function rawQuery<T = unknown>(
   });
 
   return (await resultSet.json()) as T;
+}
+
+async function command(
+  query: string,
+  params: Record<string, unknown> = {},
+  name?: string,
+  sensitiveParams: readonly string[] = [],
+) {
+  logQuery(query, params, name, sensitiveParams);
+
+  await connect();
+
+  return clickhouse.command({ query, query_params: params });
 }
 
 async function insert(table: string, values: any[]) {
@@ -736,5 +768,6 @@ export default {
   findUnique,
   findFirst,
   rawQuery,
+  command,
   insert,
 };

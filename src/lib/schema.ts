@@ -1,6 +1,19 @@
 import { z } from 'zod';
 import { isValidTimezone, normalizeTimezone } from '@/lib/date';
-import { UNIT_TYPES } from './constants';
+import {
+  EXPERIMENT_ASSIGNMENT_POLICY,
+  EXPERIMENT_ATTRIBUTION_SCOPES,
+  EXPERIMENT_BUCKETING_VERSION,
+  EXPERIMENT_COUNTING_MODES,
+  EXPERIMENT_DESIRED_DIRECTIONS,
+  EXPERIMENT_OUTCOME_ROLES,
+  EXPERIMENT_OUTCOME_TYPES,
+  EXPERIMENT_SAFEGUARD_DEFAULTS,
+  EXPERIMENT_STANDARD_METRICS,
+  EXPERIMENT_STATISTICAL_MODEL,
+  EXPERIMENT_STATISTICS_VERSION,
+} from '@/lib/experiments/types';
+import { CURRENCIES, UNIT_TYPES } from './constants';
 
 export const timezoneParam = z
   .string()
@@ -347,17 +360,19 @@ export const segmentParamSchema = z.object({
 });
 
 export const featureFlagValueTypeParam = z.enum(['boolean', 'string', 'number', 'json']);
+export const featureFlagVariationSchema = z.object({ value: z.json() });
+export const featureFlagRolloutSchema = z.object({
+  percentage: z.number().min(0).max(100),
+  weights: z.array(z.number().min(0).max(1)).optional(),
+});
 
 const featureFlagDefinitionShape = {
   name: z.string().trim().min(1).max(200),
   description: z.string().max(5000).optional(),
   valueType: featureFlagValueTypeParam,
   enabled: z.boolean(),
-  variations: z.array(z.object({ value: z.json() })).min(2),
-  rollout: z.object({
-    percentage: z.number().min(0).max(100),
-    weights: z.array(z.number().min(0).max(1)).optional(),
-  }),
+  variations: z.array(featureFlagVariationSchema).min(2),
+  rollout: featureFlagRolloutSchema,
   defaultVariation: z.number().int().nonnegative(),
 };
 
@@ -418,3 +433,290 @@ export const featureFlagCreateSchema = z
 export const featureFlagUpdateSchema = z
   .object(featureFlagDefinitionShape)
   .superRefine(validateFeatureFlagDefinition);
+
+export const experimentOutcomeTypeParam = z.enum(EXPERIMENT_OUTCOME_TYPES);
+export const experimentOutcomeRoleParam = z.enum(EXPERIMENT_OUTCOME_ROLES);
+export const experimentCountingModeParam = z.enum(EXPERIMENT_COUNTING_MODES);
+export const experimentAttributionScopeParam = z.enum(EXPERIMENT_ATTRIBUTION_SCOPES);
+export const experimentDesiredDirectionParam = z.enum(EXPERIMENT_DESIRED_DIRECTIONS);
+
+const experimentOutcomeSourceSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('standard'),
+    metric: z.enum(EXPERIMENT_STANDARD_METRICS),
+  }),
+  z.object({
+    type: z.literal('event'),
+    eventName: z.string().trim().min(1).max(50),
+    numericField: z.string().trim().min(1).max(500).optional(),
+  }),
+]);
+
+export const experimentOutcomeSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200),
+    type: experimentOutcomeTypeParam,
+    source: experimentOutcomeSourceSchema,
+    countingMode: experimentCountingModeParam,
+    attributionScope: experimentAttributionScopeParam,
+    visitorWindowDays: z.number().int().min(1).max(30).default(14),
+    desiredDirection: experimentDesiredDirectionParam,
+    role: experimentOutcomeRoleParam,
+    currency: z
+      .string()
+      .refine(value => CURRENCIES.some(currency => currency.id === value), {
+        message: 'Currency must be supported by Umami',
+      })
+      .optional(),
+  })
+  .superRefine((outcome, context) => {
+    const requiredCountingMode = {
+      conversion: 'unique',
+      count: 'count',
+      value: 'sum',
+      revenue: 'sum',
+      duration: 'sum',
+    }[outcome.type];
+
+    if (outcome.countingMode !== requiredCountingMode) {
+      context.addIssue({
+        code: 'custom',
+        path: ['countingMode'],
+        message: `${outcome.type} Outcomes require ${requiredCountingMode} counting`,
+      });
+    }
+
+    if (outcome.type === 'value' && outcome.source.type !== 'event') {
+      context.addIssue({
+        code: 'custom',
+        path: ['source'],
+        message: 'Value Outcomes require an event source',
+      });
+    }
+
+    if (
+      (outcome.type === 'value' || outcome.type === 'duration') &&
+      outcome.source.type === 'event' &&
+      !outcome.source.numericField
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['source', 'numericField'],
+        message: `${outcome.type} event Outcomes require a numeric field`,
+      });
+    }
+
+    if (outcome.type === 'revenue' && !outcome.currency) {
+      context.addIssue({
+        code: 'custom',
+        path: ['currency'],
+        message: 'Revenue Outcomes require exactly one currency',
+      });
+    } else if (outcome.type !== 'revenue' && outcome.currency) {
+      context.addIssue({
+        code: 'custom',
+        path: ['currency'],
+        message: 'Currency is valid only for Revenue Outcomes',
+      });
+    }
+
+    if (outcome.source.type === 'standard') {
+      const validStandardMetrics = {
+        conversion: ['pageview', 'visit'],
+        count: ['pageview', 'visit'],
+        value: [],
+        revenue: ['revenue'],
+        duration: ['session-duration'],
+      }[outcome.type] as readonly string[];
+
+      if (!validStandardMetrics.includes(outcome.source.metric)) {
+        context.addIssue({
+          code: 'custom',
+          path: ['source', 'metric'],
+          message: `${outcome.source.metric} is not a valid standard metric for ${outcome.type}`,
+        });
+      }
+    }
+  });
+
+export const experimentSegmentSnapshotSchema = z.object({
+  segmentId: z.uuid(),
+  type: segmentTypeParam,
+  name: z.string().trim().min(1).max(200),
+  parameters: z.json(),
+});
+
+const experimentAssignmentPolicySchema = z
+  .object({
+    identified: z.literal(EXPERIMENT_ASSIGNMENT_POLICY.identified),
+    anonymous: z.literal(EXPERIMENT_ASSIGNMENT_POLICY.anonymous),
+  })
+  .default({ ...EXPERIMENT_ASSIGNMENT_POLICY });
+
+const experimentStatisticalModelSchema = z
+  .object({
+    conversion: z.object({
+      model: z.literal(EXPERIMENT_STATISTICAL_MODEL.conversion.model),
+      alpha: z.literal(EXPERIMENT_STATISTICAL_MODEL.conversion.alpha),
+      beta: z.literal(EXPERIMENT_STATISTICAL_MODEL.conversion.beta),
+    }),
+    count: z.object({
+      model: z.literal(EXPERIMENT_STATISTICAL_MODEL.count.model),
+      shape: z.literal(EXPERIMENT_STATISTICAL_MODEL.count.shape),
+      rate: z.literal(EXPERIMENT_STATISTICAL_MODEL.count.rate),
+    }),
+    continuous: z.object({
+      model: z.literal(EXPERIMENT_STATISTICAL_MODEL.continuous.model),
+    }),
+  })
+  .default({
+    conversion: { ...EXPERIMENT_STATISTICAL_MODEL.conversion },
+    count: { ...EXPERIMENT_STATISTICAL_MODEL.count },
+    continuous: { ...EXPERIMENT_STATISTICAL_MODEL.continuous },
+  });
+
+export const experimentSafeguardsSchema = z
+  .object({
+    minimumSampleSizePerVariation: z
+      .number()
+      .int()
+      .min(1)
+      .max(1_000_000)
+      .default(EXPERIMENT_SAFEGUARD_DEFAULTS.minimumSampleSizePerVariation),
+    minimumActiveDays: z
+      .number()
+      .int()
+      .min(1)
+      .max(90)
+      .default(EXPERIMENT_SAFEGUARD_DEFAULTS.minimumActiveDays),
+    probabilityToWinThreshold: z
+      .number()
+      .min(0.5)
+      .lt(1)
+      .default(EXPERIMENT_SAFEGUARD_DEFAULTS.probabilityToWinThreshold),
+    expectedLossThreshold: z
+      .number()
+      .nonnegative()
+      .max(1_000_000_000)
+      .default(EXPERIMENT_SAFEGUARD_DEFAULTS.expectedLossThreshold),
+    sampleRatioMismatchAlpha: z
+      .number()
+      .gt(0)
+      .max(0.1)
+      .default(EXPERIMENT_SAFEGUARD_DEFAULTS.sampleRatioMismatchAlpha),
+  })
+  .default({ ...EXPERIMENT_SAFEGUARD_DEFAULTS });
+
+export const experimentCreateSchema = z.object({
+  featureFlagId: z.uuid(),
+  name: z.string().trim().min(1).max(200),
+  description: z.string().max(5000).nullable().optional(),
+});
+
+export const experimentUpdateSchema = z.object({
+  name: z.string().trim().min(1).max(200).optional(),
+  description: z.string().max(5000).nullable().optional(),
+});
+
+export const experimentRunDraftSchema = z
+  .object({
+    featureFlag: z.object({
+      key: z.string().trim().min(1).max(200),
+      valueType: featureFlagValueTypeParam,
+      variations: z.array(featureFlagVariationSchema).min(2).max(10),
+      rollout: featureFlagRolloutSchema.extend({
+        weights: z.array(z.number().gt(0).max(1)).min(2).max(10),
+      }),
+      fallthroughVariation: z.number().int().nonnegative(),
+    }),
+    baselineVariation: z.number().int().nonnegative(),
+    outcomes: z.array(experimentOutcomeSchema).min(1).max(11),
+    assignmentPolicy: experimentAssignmentPolicySchema,
+    audienceSegment: experimentSegmentSnapshotSchema.nullable().default(null),
+    exclusionSegment: experimentSegmentSnapshotSchema.nullable().default(null),
+    statisticsVersion: z
+      .literal(EXPERIMENT_STATISTICS_VERSION)
+      .default(EXPERIMENT_STATISTICS_VERSION),
+    bucketingVersion: z.literal(EXPERIMENT_BUCKETING_VERSION).default(EXPERIMENT_BUCKETING_VERSION),
+    statisticalModel: experimentStatisticalModelSchema,
+    safeguards: experimentSafeguardsSchema,
+  })
+  .superRefine((draft, context) => {
+    const variationCount = draft.featureFlag.variations.length;
+
+    if (draft.baselineVariation >= variationCount) {
+      context.addIssue({
+        code: 'custom',
+        path: ['baselineVariation'],
+        message: 'Baseline must reference exactly one existing Variation',
+      });
+    }
+
+    if (draft.featureFlag.fallthroughVariation >= variationCount) {
+      context.addIssue({
+        code: 'custom',
+        path: ['featureFlag', 'fallthroughVariation'],
+        message: 'Fallthrough must reference an existing Variation',
+      });
+    }
+
+    const { weights } = draft.featureFlag.rollout;
+    if (weights.length !== variationCount) {
+      context.addIssue({
+        code: 'custom',
+        path: ['featureFlag', 'rollout', 'weights'],
+        message: 'Weights must contain one entry per Variation',
+      });
+    } else if (Math.abs(weights.reduce((sum, weight) => sum + weight, 0) - 1) > 0.000001) {
+      context.addIssue({
+        code: 'custom',
+        path: ['featureFlag', 'rollout', 'weights'],
+        message: 'Weights must sum to 1',
+      });
+    }
+
+    for (const [index, variation] of draft.featureFlag.variations.entries()) {
+      const value = variation.value;
+      const valid =
+        draft.featureFlag.valueType === 'json' ||
+        (draft.featureFlag.valueType === 'boolean' && typeof value === 'boolean') ||
+        (draft.featureFlag.valueType === 'string' && typeof value === 'string') ||
+        (draft.featureFlag.valueType === 'number' && typeof value === 'number');
+
+      if (!valid) {
+        context.addIssue({
+          code: 'custom',
+          path: ['featureFlag', 'variations', index, 'value'],
+          message: `Variation must contain a ${draft.featureFlag.valueType} value`,
+        });
+      }
+    }
+
+    const primaryCount = draft.outcomes.filter(outcome => outcome.role === 'primary').length;
+    const secondaryCount = draft.outcomes.filter(outcome => outcome.role === 'secondary').length;
+
+    if (primaryCount !== 1) {
+      context.addIssue({
+        code: 'custom',
+        path: ['outcomes'],
+        message: 'A Run requires exactly one Primary Outcome',
+      });
+    }
+
+    if (secondaryCount > 10) {
+      context.addIssue({
+        code: 'custom',
+        path: ['outcomes'],
+        message: 'A Run allows at most ten Secondary Outcomes',
+      });
+    }
+  });
+
+export const experimentRunRequestSchema = z.object({
+  mutualExclusionGroupId: z.uuid().nullable().optional(),
+  configuration: experimentRunDraftSchema,
+});
+
+export const experimentPromoteSchema = z.object({
+  winningVariation: z.number().int().nonnegative(),
+});

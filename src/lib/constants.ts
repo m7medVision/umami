@@ -104,6 +104,7 @@ export const COLLECTION_TYPE = {
   event: 'event',
   identify: 'identify',
   performance: 'performance',
+  flagExposure: 'flag-exposure',
   record: 'record',
 } as const;
 

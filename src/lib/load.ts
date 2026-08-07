@@ -7,7 +7,15 @@ export async function fetchWebsite(websiteId: string): Promise<Website> {
   let website = null;
 
   if (redis.enabled) {
-    website = await redis.client.fetch(`website:${websiteId}`, () => getWebsite(websiteId), 86400);
+    try {
+      website = await redis.client.fetch(
+        `website:${websiteId}`,
+        () => getWebsite(websiteId),
+        86400,
+      );
+    } catch {
+      website = await getWebsite(websiteId);
+    }
   } else {
     website = await getWebsite(websiteId);
   }
@@ -21,11 +29,15 @@ export async function fetchWebsite(websiteId: string): Promise<Website> {
 
 export async function fetchWebsiteFeatureFlags(websiteId: string): Promise<FeatureFlag[]> {
   if (redis.enabled) {
-    return redis.client.fetch(
-      `website:${websiteId}:flags`,
-      () => getWebsiteFeatureFlagDefinitions(websiteId),
-      300,
-    );
+    try {
+      return await redis.client.fetch(
+        `website:${websiteId}:flags`,
+        () => getWebsiteFeatureFlagDefinitions(websiteId),
+        300,
+      );
+    } catch {
+      return getWebsiteFeatureFlagDefinitions(websiteId);
+    }
   }
 
   return getWebsiteFeatureFlagDefinitions(websiteId);
@@ -33,7 +45,11 @@ export async function fetchWebsiteFeatureFlags(websiteId: string): Promise<Featu
 
 export async function clearWebsiteFeatureFlags(websiteId: string) {
   if (redis.enabled) {
-    await redis.client.del(`website:${websiteId}:flags`);
+    try {
+      await redis.client.del(`website:${websiteId}:flags`);
+    } catch {
+      // PostgreSQL is authoritative. Cache invalidation is best-effort during Redis outages.
+    }
   }
 }
 
@@ -41,11 +57,15 @@ export async function fetchSession(websiteId: string, sessionId: string): Promis
   let session = null;
 
   if (redis.enabled) {
-    session = await redis.client.fetch(
-      `session:${sessionId}`,
-      () => getWebsiteSession(websiteId, sessionId),
-      86400,
-    );
+    try {
+      session = await redis.client.fetch(
+        `session:${sessionId}`,
+        () => getWebsiteSession(websiteId, sessionId),
+        86400,
+      );
+    } catch {
+      session = await getWebsiteSession(websiteId, sessionId);
+    }
   } else {
     session = await getWebsiteSession(websiteId, sessionId);
   }

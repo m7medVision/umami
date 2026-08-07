@@ -138,9 +138,15 @@ export function useWebsiteNavItems(websiteId: string) {
         },
         {
           id: 'flags',
-          label: 'Feature flags',
+          label: t(labels.featureFlags),
           icon: <Lightning />,
           path: renderPath('/flags'),
+        },
+        {
+          id: 'experiments',
+          label: t(labels.experiments),
+          icon: <Target />,
+          path: renderPath('/experiments'),
         },
       ],
     },

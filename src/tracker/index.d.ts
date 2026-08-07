@@ -164,9 +164,17 @@ export type UmamiTracker = {
       },
     ): Promise<void>;
   };
+  /**
+   * Read a flag synchronously. Experiment UI should first `await umami.flags()`
+   * so the returned value is a resolved server assignment rather than fallback.
+   */
   getFeatureValue: <T = unknown>(key: string, defaultValue?: T) => T | unknown;
+  /** Experiment UI should first `await umami.flags()` before rendering. */
   isFeatureEnabled: (key: string) => boolean;
-  flags: () => Promise<
+  /** Explicitly record Exposure for a known, server-resolved Experiment assignment. */
+  exposeFeatureFlag: (key: string) => boolean;
+  /** Resolve flags with optional in-memory attributes used by Experiment audience filters. */
+  flags: (context?: EventData) => Promise<
     Record<
       string,
       {

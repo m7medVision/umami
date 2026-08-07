@@ -22,8 +22,10 @@ export type TrackedProperties = {
   /**
    * Page referrer
    *
-   * @description extracted from `document.referrer`
-   * @example 'https://analytics.umami.is/docs/getting-started'
+   * @description extracted from `document.referrer` on page load, or the previous
+   * in-app URL on client-side navigation. Same-origin referrers are sent as
+   * root-relative paths so the site's own domain is never saved as a referrer.
+   * @example 'https://analytics.umami.is/docs/getting-started', '/docs/getting-started'
    */
   referrer?: string;
 
@@ -174,9 +176,17 @@ export type UmamiTracker = {
      */
     (data: EventData & { id?: string }): Promise<void>;
   };
+  /**
+   * Read a flag synchronously. Experiment UI should first `await umami.flags()`
+   * so the returned value is a resolved server assignment rather than fallback.
+   */
   getFeatureValue: <T = unknown>(key: string, defaultValue?: T) => T | unknown;
+  /** Experiment UI should first `await umami.flags()` before rendering. */
   isFeatureEnabled: (key: string) => boolean;
-  flags: () => Promise<Record<string, { enabled: boolean; value: unknown }>>;
+  /** Explicitly record Exposure for a known, server-resolved Experiment assignment. */
+  exposeFeatureFlag: (key: string) => boolean;
+  /** Resolve flags with optional in-memory attributes used by Experiment audience filters. */
+  flags: (context?: EventData) => Promise<Record<string, { enabled: boolean; value: unknown }>>;
   getSession: () => {
     cache: string | undefined;
     website: string | null;
@@ -229,10 +239,16 @@ type MetricEntry = PerformanceEntry & {
   const { hostname, href, origin } = location;
 
   let localStorage: Storage | undefined;
+  let sessionStorage: Storage | undefined;
   try {
     localStorage = href.startsWith('data:') ? undefined : window.localStorage;
   } catch {
     /* (DOMException) SecurityError: Access is denied for this document. */
+  }
+  try {
+    sessionStorage = href.startsWith('data:') ? undefined : window.sessionStorage;
+  } catch {
+    /* Storage can be unavailable in sandboxed/private contexts. */
   }
 
   const _data = 'data-';
@@ -253,6 +269,7 @@ type MetricEntry = PerformanceEntry & {
   const credentials = (config('fetch-credentials') || 'omit') as RequestCredentials;
   const perf = config('performance') === _true;
   const autoPageview = config('auto-pageview') !== _false;
+  const autoFlagExposure = config('auto-flag-exposure') !== _false;
 
   const domains = domain.split(',').map(n => n.trim());
   const host =
@@ -263,6 +280,8 @@ type MetricEntry = PerformanceEntry & {
   const eventRegex = /data-umami-event-([\w-_]+)/;
   const eventNameAttribute = `${_data}umami-event`;
   const delayDuration = 300;
+  const assignmentStorageKey = 'umami.flag.assignment';
+  const sdkVersion = '3.2.0';
 
   /* Helper functions */
 
@@ -281,7 +300,7 @@ type MetricEntry = PerformanceEntry & {
   // Strip the origin from same-origin referrers so the referrer domain
   // is never saved when it matches the current hostname
   const stripOrigin = (url: string): string =>
-    url === origin || url?.startsWith(origin + '/') ? url.slice(origin.length) : url;
+    url === origin || url?.startsWith(`${origin}/`) ? url.slice(origin.length) : url;
 
   const getPayload = () => ({
     website,
@@ -298,6 +317,34 @@ type MetricEntry = PerformanceEntry & {
   const hasDoNotTrack = () => {
     const dnt = doNotTrack || ndnt || msdnt;
     return dnt === 1 || dnt === '1' || dnt === 'yes';
+  };
+
+  const randomUuid = () => {
+    if (typeof window.crypto?.randomUUID === 'function') return window.crypto.randomUUID();
+    const bytes = new Uint8Array(16);
+    if (typeof window.crypto?.getRandomValues === 'function') {
+      window.crypto.getRandomValues(bytes);
+    } else {
+      for (let index = 0; index < bytes.length; index++) {
+        bytes[index] = Math.floor(Math.random() * 256);
+      }
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+
+  const getAssignmentKey = () => {
+    try {
+      const stored = sessionStorage?.getItem(assignmentStorageKey);
+      if (stored) return stored;
+      const created = randomUuid();
+      sessionStorage?.setItem(assignmentStorageKey, created);
+      return created;
+    } catch {
+      return randomUuid();
+    }
   };
 
   /* Event handlers */
@@ -447,9 +494,14 @@ type MetricEntry = PerformanceEntry & {
     data?: EventData,
   ): Promise<void> => {
     const nextIdentity = typeof id === 'string' ? id : id.id;
+    const nextContext = { ...(typeof id === 'object' ? id : data) };
+    delete nextContext.id;
+    const identityChanged = nextIdentity !== undefined && nextIdentity !== identity;
+    const contextChanged = JSON.stringify(nextContext) !== JSON.stringify(flagEvaluationContext);
 
-    if (nextIdentity !== undefined && nextIdentity !== identity) {
-      identity = nextIdentity;
+    if (identityChanged) identity = nextIdentity;
+    if (identityChanged || contextChanged) {
+      flagEvaluationContext = nextContext;
       resetFlags();
     }
 
@@ -468,6 +520,8 @@ type MetricEntry = PerformanceEntry & {
   const fetchFlags = async () => {
     flagsStarted = true;
     const requestIdentity = identity;
+    const requestVersion = flagRequestVersion;
+    const requestContext = { ...getPayload(), ...flagEvaluationContext };
 
     if (!website) return flagCache;
 
@@ -475,16 +529,26 @@ type MetricEntry = PerformanceEntry & {
       const response = await fetch(flagEndpoint, {
         keepalive: true,
         method: 'POST',
-        body: JSON.stringify({ userKey: requestIdentity }),
+        body: JSON.stringify({
+          userKey: requestIdentity,
+          assignmentKey,
+          context: requestContext,
+          participate: !trackingDisabled(),
+        }),
         headers: {
           'Content-Type': 'application/json',
           'x-umami-website-id': website as string,
+          ...(typeof cache !== 'undefined' && { 'x-umami-cache': cache }),
         },
         credentials,
       });
-      const data = (await response.json()) as { flags?: typeof flagCache };
-      if (requestIdentity === identity) {
+      const data = (await response.json()) as {
+        flags?: typeof flagCache;
+        experiments?: typeof experimentCache;
+      };
+      if (requestIdentity === identity && requestVersion === flagRequestVersion) {
         flagCache = data.flags || {};
+        experimentCache = data.experiments || {};
       }
     } catch {
       /* Keep the last successful values. */
@@ -510,23 +574,112 @@ type MetricEntry = PerformanceEntry & {
     return flagPromise;
   };
 
-  const loadFlags = () => (flagsLoaded ? Promise.resolve(flagCache) : refreshFlags());
+  const loadFlags = (context?: EventData) => {
+    if (context) {
+      flagEvaluationContext = { ...flagEvaluationContext, ...context };
+      resetFlags();
+    }
+    return flagsLoaded ? Promise.resolve(flagCache) : refreshFlags();
+  };
 
   const resetFlags = () => {
+    flagRequestVersion++;
     flagCache = {};
+    experimentCache = {};
     flagsLoaded = false;
     if (flagTimer) clearTimeout(flagTimer);
     flagPromise = undefined;
     if (flagsStarted) void refreshFlags();
   };
 
+  const deliverExposure = async (payload: Payload) => {
+    if (trackingDisabled()) return;
+
+    const callback = (window as unknown as Record<string, unknown>)[beforeSend as string] as
+      | BeforeSend
+      | undefined;
+    if (typeof callback === 'function') {
+      payload = (await Promise.resolve(callback('flag-exposure', payload))) as Payload;
+    }
+    if (!payload) return;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await fetch(endpoint, {
+          keepalive: true,
+          method: 'POST',
+          body: JSON.stringify({ type: 'flag-exposure', payload }),
+          headers: {
+            'Content-Type': 'application/json',
+            'x-umami-website-id': website as string,
+            'x-umami-hostname': hostname,
+            ...(typeof cache !== 'undefined' && { 'x-umami-cache': cache }),
+          },
+          credentials,
+        });
+
+        if (response.ok) {
+          try {
+            const data = (await response.json()) as { cache?: string; disabled?: boolean } | null;
+            if (data) {
+              disabled = !!data.disabled;
+              cache = data.cache;
+            }
+          } catch {
+            /* A successful empty collection response is valid. */
+          }
+          return;
+        }
+
+        if (response.status !== 408 && response.status !== 429 && response.status < 500) return;
+      } catch {
+        /* Retry a bounded number of transient network failures. */
+      }
+
+      if (attempt < 2) {
+        await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 100 : 250));
+      }
+    }
+  };
+
+  const captureFeatureExposure = (key: string, source: 'auto' | 'explicit') => {
+    const metadata = experimentCache[key];
+    if (
+      !(key in flagCache) ||
+      !metadata?.resolved ||
+      typeof metadata.variation !== 'number' ||
+      !metadata.assignment ||
+      !metadata.reference
+    ) {
+      return false;
+    }
+
+    const deduplicationKey = `${metadata.assignment}:${key}:${metadata.variation}:${assignmentKey}`;
+    if (exposureDeduplication.has(deduplicationKey)) return true;
+    exposureDeduplication.add(deduplicationKey);
+
+    void deliverExposure({
+      website,
+      featureFlagKey: key,
+      variation: metadata.variation,
+      idempotencyKey: `${metadata.reference}.${randomUuid()}`,
+      source,
+      sdkVersion,
+    });
+    return true;
+  };
+
+  const exposeFeatureFlag = (key: string) => captureFeatureExposure(key, 'explicit');
+
   const getFeatureValue = <T = unknown>(key: string, defaultValue?: T): T | unknown => {
     void loadFlags();
+    if (autoFlagExposure) captureFeatureExposure(key, 'auto');
     return key in flagCache ? flagCache[key].value : defaultValue;
   };
 
   const isFeatureEnabled = (key: string) => {
     void loadFlags();
+    if (autoFlagExposure) captureFeatureExposure(key, 'auto');
     return flagCache[key]?.enabled === true;
   };
 
@@ -705,6 +858,7 @@ type MetricEntry = PerformanceEntry & {
       identify,
       getFeatureValue,
       isFeatureEnabled,
+      exposeFeatureFlag,
       flags: loadFlags,
       getSession: () => ({ cache, website }),
     } as UmamiTracker;
@@ -717,8 +871,21 @@ type MetricEntry = PerformanceEntry & {
   let disabled = false;
   let cache: string | undefined;
   let identity: string | undefined;
+  let flagEvaluationContext: EventData = {};
+  const assignmentKey = getAssignmentKey();
+  const exposureDeduplication = new Set<string>();
   let flagCache: Record<string, { enabled: boolean; value: unknown }> = {};
+  let experimentCache: Record<
+    string,
+    {
+      resolved: boolean;
+      variation?: number;
+      assignment?: string;
+      reference?: string;
+    }
+  > = {};
   let flagPromise: Promise<typeof flagCache> | undefined;
+  let flagRequestVersion = 0;
   let flagTimer: ReturnType<typeof setTimeout> | undefined;
   let flagsStarted = false;
   let flagsLoaded = false;

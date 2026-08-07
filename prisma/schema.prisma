@@ -94,18 +94,24 @@ model Website {
   recorderEnabled Boolean @default(false) @map("recorder_enabled")
   replayConfig    Json?   @map("replay_config")
 
-  user                User?                @relation("user", fields: [userId], references: [id])
-  createUser          User?                @relation("createUser", fields: [createdBy], references: [id])
-  team                Team?                @relation(fields: [teamId], references: [id])
-  eventData           EventData[]
-  reports             Report[]
-  revenue             Revenue[]
-  segments            Segment[]
-  sessionData         SessionData[]
-  sessionReplays      SessionReplay[]
-  sessionReplaysSaved SessionReplaySaved[]
-  heatmapEvents       HeatmapEvent[]
-  featureFlags        FeatureFlag[]
+  user                    User?                    @relation("user", fields: [userId], references: [id])
+  createUser              User?                    @relation("createUser", fields: [createdBy], references: [id])
+  team                    Team?                    @relation(fields: [teamId], references: [id])
+  eventData               EventData[]
+  reports                 Report[]
+  revenue                 Revenue[]
+  segments                Segment[]
+  sessionData             SessionData[]
+  sessionReplays          SessionReplay[]
+  sessionReplaysSaved     SessionReplaySaved[]
+  heatmapEvents           HeatmapEvent[]
+  featureFlags            FeatureFlag[]
+  experiments             Experiment[]
+  experimentRuns          ExperimentRun[]
+  mutualExclusionGroups   MutualExclusionGroup[]
+  experimentPromotions    ExperimentPromotion[]
+  experimentNotifications ExperimentNotification[]
+  experimentPrivacyAudits ExperimentPrivacyAudit[]
 
   @@index([userId])
   @@index([teamId])
@@ -204,12 +210,12 @@ model SessionData {
   website Website @relation(fields: [websiteId], references: [id])
   session Session @relation(fields: [sessionId], references: [id])
 
+  @@unique([sessionId, dataKey])
   @@index([createdAt])
   @@index([websiteId])
   @@index([sessionId])
   @@index([sessionId, createdAt])
   @@index([websiteId, createdAt, dataKey])
-  @@unique([sessionId, dataKey])
   @@map("session_data")
 }
 
@@ -298,12 +304,219 @@ model FeatureFlag {
   defaultVariation Int       @map("default_variation")
   createdAt        DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt        DateTime? @updatedAt @map("updated_at") @db.Timestamptz(6)
+  archivedAt       DateTime? @map("archived_at") @db.Timestamptz(6)
 
-  website Website @relation(fields: [websiteId], references: [id])
+  website              Website               @relation(fields: [websiteId], references: [id])
+  experiments          Experiment[]
+  experimentRuns       ExperimentRun[]
+  experimentPromotions ExperimentPromotion[]
 
   @@unique([websiteId, key])
   @@index([websiteId])
+  @@index([websiteId, archivedAt])
   @@map("feature_flag")
+}
+
+model Experiment {
+  id            String    @id() @map("experiment_id") @db.Uuid
+  websiteId     String    @map("website_id") @db.Uuid
+  featureFlagId String    @map("feature_flag_id") @db.Uuid
+  name          String    @db.VarChar(200)
+  description   String?   @db.Text
+  createdAt     DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime? @updatedAt @map("updated_at") @db.Timestamptz(6)
+  archivedAt    DateTime? @map("archived_at") @db.Timestamptz(6)
+
+  website       Website                  @relation(fields: [websiteId], references: [id])
+  featureFlag   FeatureFlag              @relation(fields: [featureFlagId], references: [id])
+  runs          ExperimentRun[]
+  notifications ExperimentNotification[]
+
+  @@index([websiteId])
+  @@index([featureFlagId])
+  @@index([websiteId, archivedAt])
+  @@map("experiment")
+}
+
+model ExperimentRun {
+  id                          String    @id() @map("experiment_run_id") @db.Uuid
+  experimentId                String    @map("experiment_id") @db.Uuid
+  websiteId                   String    @map("website_id") @db.Uuid
+  featureFlagId               String    @map("feature_flag_id") @db.Uuid
+  mutualExclusionGroupId      String?   @map("mutual_exclusion_group_id") @db.Uuid
+  runNumber                   Int       @map("run_number") @db.Integer
+  status                      String    @default("Draft") @db.VarChar(20)
+  featureFlagKey              String    @map("feature_flag_key") @db.VarChar(200)
+  featureFlagValueType        String    @map("feature_flag_value_type") @db.VarChar(20)
+  featureFlagVariations       Json      @map("feature_flag_variations") @db.JsonB
+  variationWeights            Json      @map("variation_weights") @db.JsonB
+  rolloutPercentage           Float     @map("rollout_percentage") @db.DoublePrecision
+  fallthroughVariation        Int       @map("fallthrough_variation") @db.Integer
+  baselineVariation           Int       @map("baseline_variation") @db.Integer
+  assignmentPolicy            Json      @map("assignment_policy") @db.JsonB
+  audienceSegmentSnapshot     Json?     @map("audience_segment_snapshot") @db.JsonB
+  exclusionSegmentSnapshot    Json?     @map("exclusion_segment_snapshot") @db.JsonB
+  statisticsVersion           String    @map("statistics_version") @db.VarChar(50)
+  bucketingVersion            String    @map("bucketing_version") @db.VarChar(50)
+  statisticalModel            Json      @map("statistical_model") @db.JsonB
+  safeguards                  Json      @db.JsonB
+  readinessStatus             String    @default("NotReady") @map("readiness_status") @db.VarChar(20)
+  readinessChecks             Json?     @map("readiness_checks") @db.JsonB
+  readyAt                     DateTime? @map("ready_at") @db.Timestamptz(6)
+  startedAt                   DateTime? @map("started_at") @db.Timestamptz(6)
+  firstExposureAt             DateTime? @map("first_exposure_at") @db.Timestamptz(6)
+  pausedAt                    DateTime? @map("paused_at") @db.Timestamptz(6)
+  accumulatedPausedDurationMs BigInt    @default(0) @map("accumulated_paused_duration_ms") @db.BigInt
+  completedAt                 DateTime? @map("completed_at") @db.Timestamptz(6)
+  provisionalUntil            DateTime? @map("provisional_until") @db.Timestamptz(6)
+  finalizedAt                 DateTime? @map("finalized_at") @db.Timestamptz(6)
+  archivedAt                  DateTime? @map("archived_at") @db.Timestamptz(6)
+  rawDataRetainedUntil        DateTime? @map("raw_data_retained_until") @db.Timestamptz(6)
+  rawDataExpiredAt            DateTime? @map("raw_data_expired_at") @db.Timestamptz(6)
+  lastComputedAt              DateTime? @map("last_computed_at") @db.Timestamptz(6)
+  createdAt                   DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                   DateTime? @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  experiment           Experiment                @relation(fields: [experimentId], references: [id])
+  website              Website                   @relation(fields: [websiteId], references: [id])
+  featureFlag          FeatureFlag               @relation(fields: [featureFlagId], references: [id])
+  mutualExclusionGroup MutualExclusionGroup?     @relation(fields: [mutualExclusionGroupId], references: [id])
+  outcomes             ExperimentOutcome[]
+  resultSnapshot       ExperimentResultSnapshot?
+  promotions           ExperimentPromotion[]
+  notifications        ExperimentNotification[]
+
+  @@unique([experimentId, runNumber])
+  @@index([experimentId])
+  @@index([websiteId])
+  @@index([featureFlagId])
+  @@index([mutualExclusionGroupId])
+  @@index([websiteId, status])
+  @@index([status, provisionalUntil])
+  @@index([status, lastComputedAt])
+  @@index([rawDataExpiredAt, rawDataRetainedUntil])
+  @@map("experiment_run")
+}
+
+model ExperimentOutcome {
+  id                String    @id() @map("experiment_outcome_id") @db.Uuid
+  experimentRunId   String    @map("experiment_run_id") @db.Uuid
+  position          Int       @db.Integer
+  name              String    @db.VarChar(200)
+  type              String    @db.VarChar(20)
+  sourceType        String    @map("source_type") @db.VarChar(20)
+  sourceValue       String    @map("source_value") @db.VarChar(200)
+  numericField      String?   @map("numeric_field") @db.VarChar(500)
+  countingMode      String    @map("counting_mode") @db.VarChar(20)
+  attributionScope  String    @map("attribution_scope") @db.VarChar(20)
+  visitorWindowDays Int       @default(14) @map("visitor_window_days") @db.Integer
+  desiredDirection  String    @map("desired_direction") @db.VarChar(20)
+  role              String    @db.VarChar(20)
+  currency          String?   @db.VarChar(3)
+  createdAt         DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  experimentRun ExperimentRun @relation(fields: [experimentRunId], references: [id])
+
+  @@unique([experimentRunId, position])
+  @@index([experimentRunId])
+  @@index([experimentRunId, role])
+  @@map("experiment_outcome")
+}
+
+model MutualExclusionGroup {
+  id          String    @id() @map("mutual_exclusion_group_id") @db.Uuid
+  websiteId   String    @map("website_id") @db.Uuid
+  name        String    @db.VarChar(200)
+  description String?   @db.Text
+  createdAt   DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime? @updatedAt @map("updated_at") @db.Timestamptz(6)
+  archivedAt  DateTime? @map("archived_at") @db.Timestamptz(6)
+
+  website Website         @relation(fields: [websiteId], references: [id])
+  runs    ExperimentRun[]
+
+  @@index([websiteId])
+  @@index([websiteId, archivedAt])
+  @@map("mutual_exclusion_group")
+}
+
+model ExperimentResultSnapshot {
+  id                  String    @id() @map("experiment_result_snapshot_id") @db.Uuid
+  experimentRunId     String    @unique @map("experiment_run_id") @db.Uuid
+  statisticsVersion   String    @map("statistics_version") @db.VarChar(50)
+  results             Json      @db.JsonB
+  diagnostics         Json      @db.JsonB
+  safeguardResults    Json      @map("safeguard_results") @db.JsonB
+  sourceDataThroughAt DateTime  @map("source_data_through_at") @db.Timestamptz(6)
+  computedAt          DateTime  @map("computed_at") @db.Timestamptz(6)
+  createdAt           DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  experimentRun ExperimentRun @relation(fields: [experimentRunId], references: [id])
+
+  @@index([computedAt])
+  @@map("experiment_result_snapshot")
+}
+
+model ExperimentPromotion {
+  id                   String    @id() @map("experiment_promotion_id") @db.Uuid
+  websiteId            String    @map("website_id") @db.Uuid
+  experimentRunId      String    @map("experiment_run_id") @db.Uuid
+  featureFlagId        String    @map("feature_flag_id") @db.Uuid
+  winningVariation     Int       @map("winning_variation") @db.Integer
+  previousFlagSnapshot Json      @map("previous_flag_snapshot") @db.JsonB
+  promotedBy           String?   @map("promoted_by") @db.Uuid
+  promotedAt           DateTime  @map("promoted_at") @db.Timestamptz(6)
+  rolledBackBy         String?   @map("rolled_back_by") @db.Uuid
+  rolledBackAt         DateTime? @map("rolled_back_at") @db.Timestamptz(6)
+  createdAt            DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime? @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  website       Website       @relation(fields: [websiteId], references: [id])
+  experimentRun ExperimentRun @relation(fields: [experimentRunId], references: [id])
+  featureFlag   FeatureFlag   @relation(fields: [featureFlagId], references: [id])
+
+  @@index([websiteId])
+  @@index([experimentRunId])
+  @@index([featureFlagId])
+  @@index([featureFlagId, promotedAt])
+  @@map("experiment_promotion")
+}
+
+model ExperimentNotification {
+  id              String    @id() @map("experiment_notification_id") @db.Uuid
+  websiteId       String    @map("website_id") @db.Uuid
+  experimentId    String?   @map("experiment_id") @db.Uuid
+  experimentRunId String?   @map("experiment_run_id") @db.Uuid
+  type            String    @db.VarChar(50)
+  dedupeKey       String    @unique @map("dedupe_key") @db.VarChar(200)
+  data            Json      @db.JsonB
+  readAt          DateTime? @map("read_at") @db.Timestamptz(6)
+  dismissedAt     DateTime? @map("dismissed_at") @db.Timestamptz(6)
+  createdAt       DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  website       Website        @relation(fields: [websiteId], references: [id])
+  experiment    Experiment?    @relation(fields: [experimentId], references: [id])
+  experimentRun ExperimentRun? @relation(fields: [experimentRunId], references: [id])
+
+  @@index([websiteId])
+  @@index([experimentId])
+  @@index([experimentRunId])
+  @@index([websiteId, dismissedAt, createdAt])
+  @@index([websiteId, readAt, createdAt])
+  @@map("experiment_notification")
+}
+
+model ExperimentPrivacyAudit {
+  id          String    @id() @map("experiment_privacy_audit_id") @db.Uuid
+  websiteId   String    @map("website_id") @db.Uuid
+  requestedBy String?   @map("requested_by") @db.Uuid
+  operation   String    @default("visitor-data-deletion") @db.VarChar(50)
+  createdAt   DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  website Website @relation(fields: [websiteId], references: [id])
+
+  @@index([websiteId, createdAt])
+  @@map("experiment_privacy_audit")
 }
 
 model Revenue {

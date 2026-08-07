@@ -1,7 +1,8 @@
 import type { Prisma } from '@/generated/prisma/client';
+import { experimentRunService } from '@/lib/experiments/runService';
 import { clearWebsiteFeatureFlags } from '@/lib/load';
 import { parseRequest } from '@/lib/request';
-import { json, notFound, ok, unauthorized } from '@/lib/response';
+import { conflict, json, notFound, ok, unauthorized } from '@/lib/response';
 import { featureFlagUpdateSchema } from '@/lib/schema';
 import { canDeleteFeatureFlag, canUpdateFeatureFlag, canViewFeatureFlag } from '@/permissions';
 import { deleteFeatureFlag, getWebsiteFeatureFlag, updateFeatureFlag } from '@/queries/prisma';
@@ -82,7 +83,16 @@ export async function DELETE(
     return unauthorized();
   }
 
-  await deleteFeatureFlag(flagId);
+  const removal = await experimentRunService.getFeatureFlagRemoval(flagId);
+  if (removal.action === 'conflict') {
+    return conflict(removal.conflict);
+  }
+
+  if (removal.action === 'archive') {
+    await updateFeatureFlag(flagId, { enabled: false, archivedAt: new Date() });
+  } else {
+    await deleteFeatureFlag(flagId);
+  }
   await clearWebsiteFeatureFlags(websiteId);
   return ok();
 }
